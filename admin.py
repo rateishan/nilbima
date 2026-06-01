@@ -327,7 +327,9 @@ class Admin:
         Button(self.grn_win, text="Add to Invoice", command=self.add_to_invoice, font=("Arial", 15), bg="gray",cursor="hand2").place(x=50, y=550)
          # Save GRN Button
         Button(self.grn_win, text="Save GRN", command=self.save_grn_and_update_stock, font=("Arial", 15), bg="green",cursor="hand2").place(x=250, y=550)
-        
+        #delete selected 
+        delete_button = tk.Button(self.grn_win, text="Delete Selected", command=self.delete_selected, font=("Arial", 12), bg="red", fg="white", cursor="hand2")
+        delete_button.place(x=450, y=550)
 
         # Display Invoice Items
         self.tree = ttk.Treeview(self.grn_win, columns=("item", "Quantity", "Retail Price", "Wholesale Price", "Total"), show="headings")
@@ -384,6 +386,13 @@ class Admin:
         self.var_negn.set(next_grn)
         self.var_grn.set(formatted_grn)
         connection.close()
+    
+    def delete_selected(self):
+        # Get selected item
+        selected_item = self.tree.selection()
+        if selected_item:
+            # Delete the selected item from Treeview
+            self.tree.delete(selected_item)
 
 
     def search_supplier(self):
@@ -440,7 +449,6 @@ class Admin:
             self.listbox.activate(0)
 
     def save_grn_and_update_stock(self):
-        
         # 1. Validation check before opening connection
         if not self.invoice_items:
             messagebox.showerror("Error", "No items added to the list!")
@@ -450,20 +458,33 @@ class Admin:
         try:
             # Establish connection
             connection = pymysql.connect(
-                host="localhost", user="root", password="#@19is16Pro", database="nilbima"
+                host="localhost", 
+                user="root", 
+                password="#@19is16Pro", 
+                database="nilbima",
+                autocommit=False
             )
             cursor = connection.cursor()
 
-            # Prepare comma-separated strings for the grntable summary row
-            item_names = ", ".join([str(item[1]) for item in self.invoice_items])  
-            quantity = ", ".join([str(item[2]) for item in self.invoice_items])        
-            Retail_price = ",".join([str(item[3]) for item in self.invoice_items])
-            wholesale_price = ",".join([str(item[4]) for item in self.invoice_items])
+            # --- DYNAMIC STRUCTURE FIX ---
+            sample_item = self.invoice_items[0]
+            name_idx, qty_idx, retail_idx, wholesale_idx = 1, 2, 3, 4
+            
+            for i, val in enumerate(sample_item):
+                val_str = str(val).strip()
+                if i == 1 or (i == 0 and not val_str.replace('.','',1).isdigit()):
+                    if 'rohan' not in val_str.lower(): 
+                        name_idx = i
+
+            # Create comma-separated summary values for grntable
+            item_names = ", ".join([str(item[name_idx]).strip() for item in self.invoice_items])  
+            quantity = ", ".join([str(item[qty_idx]).strip() for item in self.invoice_items])        
+            Retail_price = ",".join([str(item[retail_idx]).strip() for item in self.invoice_items])
+            wholesale_price = ",".join([str(item[wholesale_idx]).strip() for item in self.invoice_items])
             
             # --- TASK 1: Insert into grntable ---
-            # NOTE: Added backticks around `retail price` due to the space in the column name
             query_grn = """
-            INSERT INTO grntable (itemsname, item, grndate, `retail price`, wholesaleprice, quantity, suppleir, totalcost) 
+            INSERT INTO grntable (itemsname, item, grndate, retailprice, wholesaleprice, quantity, supplier, totalcost) 
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """
             cursor.execute(query_grn, (
@@ -477,66 +498,54 @@ class Admin:
                 self.var_total_cost.get()   
             ))
             
-            # Retrieve the newly generated GRN ID from grntable to link with itemdetail
             grn_no = cursor.lastrowid 
 
-            # --- TASKS 2 & 3: Loop through each item to update mainstock and itemdetail ---
+            # --- TASKS 2 & 3: Loop through each item ---
             for item in self.invoice_items:
-                # Assuming item structure: (itemid/index, itemname, qty, retail_price, wholesale_price, description)
-                # Adjust index values if your self.invoice_items matches a different sequence
-                item_name = str(item[1])
-                qty_received = int(item[2])
-                r_price = float(item[3])
-                w_price = float(item[4])
-                item_detail = str(item[5]) if len(item) > 5 else "" # safe fallback for description
+                item_name = str(item[name_idx]).strip()
+                qty_received = float(str(item[qty_idx]).strip())
+                r_price = float(str(item[retail_idx]).strip())
+                w_price = float(str(item[wholesale_idx]).strip())
+                item_detail = str(item[5]).strip() if len(item) > 5 else "" 
                 
-                # A. Process mainstock table
-                # Check if the item already exists in mainstock by matching the itemname
+                # 💰 ඉන්වොයිස් එකේ අදාළ අයිතමයේ මුළු වටිනාකම (Quantity x Wholesale Price)
+                item_total_cost = qty_received * w_price
+                
+                # A. mainstock ටේබල් එක අප්ඩේට් කිරීම හෝ අලුතින් ඇතුලත් කිරීම
+                # (UNIQUE කර ඇති නිසා නම සමාන නම් කෙලින්ම stock එක එකතු වේ)
+                query_upsert = """
+                INSERT INTO mainstock (itemname, itemdetail, price, stock, adddate)
+                VALUES (%s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE 
+                    stock = stock + VALUES(stock),
+                    price = VALUES(price)
+                """
+                cursor.execute(query_upsert, (item_name, item_detail, r_price, qty_received, self.var_date.get()))
+                
+                # itemdetail එකට ලින්ක් කරන්න අවශ්‍ය itemid එක ලබා ගැනීම
                 cursor.execute("SELECT itemid FROM mainstock WHERE itemname = %s", (item_name,))
-                stock_result = cursor.fetchone()
+                item_id = cursor.fetchone()[0]
                 
-                if stock_result:
-                    # Item exists! Update stock amount and update to the newest price
-                    item_id = stock_result[0]
-                    query_update_stock = """
-                    UPDATE mainstock 
-                    SET stock = stock + %s, price = %s 
-                    WHERE itemid = %s
-                    """
-                    cursor.execute(query_update_stock, (qty_received, r_price, item_id))
-                else:
-                    # Item is completely new! Insert a fresh row into mainstock
-                    query_insert_stock = """
-                    INSERT INTO mainstock (itemname, itemdetail, price, stock, adddate) 
-                    VALUES (%s, %s, %s, %s, %s)
-                    """
-                    cursor.execute(query_insert_stock, (item_name, item_detail, r_price, qty_received, self.var_date.get()))
-                    item_id = cursor.lastrowid # Capture the new itemid generated
-                
-                # B. Process itemdetail table
-                # Insert the granular breakdown tied to the current grn_no and item_id
+                # B. itemdetail ටේබල් එකට දත්ත සහ totalcost එක එකතු කිරීම
+                # ⚠️ ඔයාගේ MySQL itemdetail ටේබල් එකේ 'totalcost' කොලම් එකේ නම මේ ආකාරයටම තියෙන්න ඕනෙ
                 query_item_detail = """
-                INSERT INTO itemdetail (itemid, qrnno, retailprice, wholesaleprice, qty) 
+                INSERT INTO itemdetail (itemid, grnno, retailprice, wholesaleprice, qty) 
                 VALUES (%s, %s, %s, %s, %s)
                 """
                 cursor.execute(query_item_detail, (item_id, grn_no, r_price, w_price, qty_received))
 
-            # Commit transactions if all statements executed without error
+            # ඔක්කොම සාර්ථක නම් ඩේටාබේස් එකට සේව් කරන්න
             connection.commit()
-            messagebox.showinfo("Success", "GRN saved, Stock updated, and Item details tracked successfully!")
-            
-            # Optional: Clear list/treeview after saving data
-            # self.invoice_items.clear()
+            messagebox.showinfo("Success", "GRN saved, Stock updated, and Item Details with Total Cost tracked successfully!")
             
         except Exception as e:
             if connection:
-                connection.rollback() # Undo database changes if code failed midway
+                connection.rollback()
             messagebox.showerror("Database Error", f"Transaction failed and rolled back.\nError: {str(e)}")
             
         finally:
             if connection:
                 connection.close()
-
 if __name__ == "__main__":
     root = Tk()
     app = Admin(root, "username")
